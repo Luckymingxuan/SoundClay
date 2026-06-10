@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """SoundClay v1.1 audio-to-MIDI engine.
 
-This first backend is intentionally dependency-free. It provides the same
-pipeline shape that model-backed transcribers will use later:
-classify instrument -> choose transcription model -> emit MIDI.
+The production path uses Spotify's open-source Basic Pitch model for MIDI
+transcription. Lightweight local analysis is still used for instrument routing
+metadata until we add a dedicated open-source instrument classifier.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
 import struct
+import sys
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,36 +25,18 @@ from typing import Optional
 SUPPORTED_EXTENSIONS = {".wav"}
 
 MODEL_BY_INSTRUMENT = {
-    "Piano": "heuristic-piano-transcriber",
-    "Guitar": "heuristic-plucked-string-transcriber",
-    "Bass": "heuristic-bass-transcriber",
-    "Vocal": "heuristic-vocal-melody-transcriber",
-    "Synth": "heuristic-synth-transcriber",
-    "Strings": "heuristic-sustained-strings-transcriber",
+    "Piano": "basic-pitch-icassp-2022-piano-route",
+    "Guitar": "basic-pitch-icassp-2022-guitar-route",
+    "Bass": "basic-pitch-icassp-2022-bass-route",
+    "Vocal": "basic-pitch-icassp-2022-vocal-route",
+    "Synth": "basic-pitch-icassp-2022-synth-route",
+    "Strings": "basic-pitch-icassp-2022-strings-route",
 }
-
-MIDI_PROGRAM_BY_INSTRUMENT = {
-    "Piano": 0,
-    "Guitar": 24,
-    "Bass": 33,
-    "Vocal": 53,
-    "Synth": 80,
-    "Strings": 48,
-}
-
 
 @dataclass
 class AudioData:
     sample_rate: int
     samples: list[float]
-
-
-@dataclass
-class Note:
-    midi: int
-    start: float
-    duration: float
-    velocity: int
 
 
 def read_wav(path: Path) -> AudioData:
@@ -129,10 +113,6 @@ def estimate_pitch(samples: list[float], sample_rate: int) -> Optional[float]:
     if best_lag == 0 or best_score <= 0:
         return None
     return sample_rate / best_lag
-
-
-def frequency_to_midi(frequency: float) -> int:
-    return max(21, min(108, round(69 + 12 * math.log2(frequency / 440.0))))
 
 
 def analyze_frames(audio: AudioData) -> list[dict[str, float | None]]:
@@ -217,108 +197,31 @@ def classify_instrument(path: Path, frames: list[dict[str, float | None]]) -> tu
     )
 
 
-def transcribe_notes(audio: AudioData, frames: list[dict[str, float | None]]) -> list[Note]:
-    active_rms = [float(frame["rms"] or 0) for frame in frames if (frame["rms"] or 0) > 0.02]
-    threshold = max(0.025, median(active_rms) * 0.7) if active_rms else 0.025
+def transcribe_with_basic_pitch(input_path: Path, output_dir: Path) -> tuple[Path, int]:
+    os.environ.setdefault("TMPDIR", "/private/tmp")
+    os.environ.setdefault("PYTHONPYCACHEPREFIX", "/private/tmp/soundclay-pycache")
 
-    notes: list[Note] = []
-    current_midi: int | None = None
-    current_start = 0.0
-    current_velocity = 64
+    with contextlib.redirect_stdout(sys.stderr):
+        try:
+            from basic_pitch import ICASSP_2022_MODEL_PATH
+            from basic_pitch.inference import predict
+        except ImportError as error:
+            raise RuntimeError(
+                "Basic Pitch is not installed. Run the app with the project .venv or install basic-pitch."
+            ) from error
 
-    for frame in frames:
-        pitch = frame["pitch"]
-        level = float(frame["rms"] or 0)
-        time = float(frame["time"] or 0)
-        midi = frequency_to_midi(pitch) if pitch and level >= threshold else None
+        _, midi_data, note_events = predict(
+            input_path,
+            model_or_model_path=ICASSP_2022_MODEL_PATH,
+            onset_threshold=0.5,
+            frame_threshold=0.3,
+            minimum_note_length=90,
+            midi_tempo=120,
+        )
 
-        if midi is None:
-            if current_midi is not None:
-                duration = max(0.08, time - current_start)
-                notes.append(Note(current_midi, current_start, duration, current_velocity))
-                current_midi = None
-            continue
-
-        velocity = max(35, min(118, int(36 + level * 420)))
-        if current_midi is None:
-            current_midi = midi
-            current_start = time
-            current_velocity = velocity
-        elif abs(midi - current_midi) > 1:
-            duration = max(0.08, time - current_start)
-            notes.append(Note(current_midi, current_start, duration, current_velocity))
-            current_midi = midi
-            current_start = time
-            current_velocity = velocity
-        else:
-            current_velocity = max(current_velocity, velocity)
-
-    if current_midi is not None:
-        final_time = len(audio.samples) / audio.sample_rate
-        notes.append(Note(current_midi, current_start, max(0.08, final_time - current_start), current_velocity))
-
-    return merge_short_notes(notes)
-
-
-def merge_short_notes(notes: list[Note]) -> list[Note]:
-    merged: list[Note] = []
-    for note in notes:
-        if merged and note.midi == merged[-1].midi and note.start - (merged[-1].start + merged[-1].duration) < 0.09:
-            previous = merged[-1]
-            previous.duration = max(previous.duration, note.start + note.duration - previous.start)
-            previous.velocity = max(previous.velocity, note.velocity)
-        elif note.duration >= 0.07:
-            merged.append(note)
-    return merged
-
-
-def vlq(value: int) -> bytes:
-    buffer = value & 0x7F
-    value >>= 7
-    while value:
-        buffer <<= 8
-        buffer |= ((value & 0x7F) | 0x80)
-        value >>= 7
-
-    output = bytearray()
-    while True:
-        output.append(buffer & 0xFF)
-        if buffer & 0x80:
-            buffer >>= 8
-        else:
-            break
-    return bytes(output)
-
-
-def write_midi(path: Path, notes: list[Note], instrument: str) -> None:
-    ticks_per_quarter = 480
-    tempo_microseconds = 500000
-    program = MIDI_PROGRAM_BY_INSTRUMENT.get(instrument, 0)
-
-    events: list[tuple[int, bytes]] = [
-        (0, b"\xff\x51\x03" + tempo_microseconds.to_bytes(3, "big")),
-        (0, b"\xc0" + bytes([program])),
-    ]
-
-    for note in notes:
-        start_tick = round(note.start * 2 * ticks_per_quarter)
-        end_tick = round((note.start + note.duration) * 2 * ticks_per_quarter)
-        events.append((start_tick, b"\x90" + bytes([note.midi, note.velocity])))
-        events.append((max(start_tick + 1, end_tick), b"\x80" + bytes([note.midi, 0])))
-
-    events.sort(key=lambda item: (item[0], item[1][0] == 0x90))
-    track = bytearray()
-    previous_tick = 0
-    for tick, payload in events:
-        track.extend(vlq(max(0, tick - previous_tick)))
-        track.extend(payload)
-        previous_tick = tick
-    track.extend(vlq(0))
-    track.extend(b"\xff\x2f\x00")
-
-    header = b"MThd" + struct.pack(">IHHH", 6, 0, 1, ticks_per_quarter)
-    track_chunk = b"MTrk" + struct.pack(">I", len(track)) + bytes(track)
-    path.write_bytes(header + track_chunk)
+    midi_path = output_dir / f"{input_path.stem}.mid"
+    midi_data.write(str(midi_path))
+    return midi_path, len(note_events)
 
 
 def process(input_path: Path, output_dir: Path) -> dict[str, object]:
@@ -326,21 +229,19 @@ def process(input_path: Path, output_dir: Path) -> dict[str, object]:
     frames = analyze_frames(audio)
     instrument, confidence, features = classify_instrument(input_path, frames)
     model = MODEL_BY_INSTRUMENT[instrument]
-    notes = transcribe_notes(audio, frames)
-
-    if not notes:
-        raise ValueError("No confident notes were detected. Try a cleaner single-instrument WAV file.")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    midi_path = output_dir / f"{input_path.stem}.mid"
-    write_midi(midi_path, notes, instrument)
+    midi_path, note_count = transcribe_with_basic_pitch(input_path, output_dir)
+
+    if note_count == 0:
+        raise ValueError("Basic Pitch did not detect notes. Try a cleaner single-instrument WAV file.")
 
     return {
         "instrument": instrument,
         "confidence": round(confidence, 2),
         "model": model,
         "midiPath": str(midi_path),
-        "noteCount": len(notes),
+        "noteCount": note_count,
         "durationSeconds": round(len(audio.samples) / audio.sample_rate, 2),
         "features": features,
     }

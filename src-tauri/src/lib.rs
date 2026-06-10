@@ -51,6 +51,15 @@ fn project_root() -> PathBuf {
         .to_path_buf()
 }
 
+fn python_executable(project_root: &PathBuf) -> PathBuf {
+    let venv_python = project_root.join(".venv").join("bin").join("python");
+    if venv_python.exists() {
+        venv_python
+    } else {
+        PathBuf::from("python3")
+    }
+}
+
 #[tauri::command]
 fn transcribe_audio(file_name: String, audio_bytes: Vec<u8>) -> Result<TranscriptionResult, String> {
     if audio_bytes.is_empty() {
@@ -68,20 +77,28 @@ fn transcribe_audio(file_name: String, audio_bytes: Vec<u8>) -> Result<Transcrip
     let input_path = work_dir.join(&safe_file_name);
     fs::write(&input_path, audio_bytes).map_err(|error| error.to_string())?;
 
-    let engine_path = project_root().join("engine").join("soundclay_engine.py");
+    let root = project_root();
+    let engine_path = root.join("engine").join("soundclay_engine.py");
     let output_dir = work_dir.join("out");
-    let output = Command::new("python3")
+    let output = Command::new(python_executable(&root))
         .arg(&engine_path)
         .arg("--input")
         .arg(&input_path)
         .arg("--output-dir")
         .arg(&output_dir)
+        .env("TMPDIR", "/private/tmp")
+        .env("PYTHONPYCACHEPREFIX", "/private/tmp/soundclay-pycache")
         .output()
         .map_err(|error| format!("Failed to launch Python engine: {error}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let response: EngineResponse = serde_json::from_str(stdout.trim()).map_err(|error| {
+    let json_line = stdout
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .ok_or_else(|| format!("Engine did not return JSON. stderr: {}", stderr.trim()))?;
+    let response: EngineResponse = serde_json::from_str(json_line.trim()).map_err(|error| {
         format!("Engine returned invalid JSON: {error}. stderr: {}", stderr.trim())
     })?;
 

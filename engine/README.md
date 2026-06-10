@@ -3,12 +3,13 @@
 v1.1 focuses on the smallest useful loop:
 
 ```text
-WAV audio -> instrument classification -> backend selection -> MIDI
+WAV audio -> instrument routing metadata -> Basic Pitch -> MIDI
 ```
 
-The current backend is dependency-free and heuristic. It is meant to keep the app
-usable while leaving clear seams for model-backed transcribers later.
+The MIDI transcription backend uses Spotify's open-source Basic Pitch model. The
+instrument label is currently lightweight routing metadata; a dedicated
+open-source classifier should replace it next.
 
 ```bash
-python3 engine/soundclay_engine.py --input piano.wav --output-dir out
+.venv/bin/python engine/soundclay_engine.py --input piano.wav --output-dir out
 ```

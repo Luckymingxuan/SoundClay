@@ -94,8 +94,8 @@ function App() {
               Audio in. MIDI out.
             </h1>
             <p className="max-w-2xl text-lg leading-8 text-stone-600">
-              Upload a single-instrument WAV. SoundClay classifies the source,
-              selects a v1.1 transcription backend, and exports editable MIDI.
+              Upload a single-instrument WAV. SoundClay routes the source,
+              runs the open-source Basic Pitch model, and exports editable MIDI.
             </p>
           </div>
         </div>
@@ -108,7 +108,7 @@ function App() {
                 Create MIDI
               </CardTitle>
               <CardDescription>
-                v1.1 supports WAV input while the model adapters are being wired in.
+                v1.1 uses Basic Pitch for MIDI transcription and WAV input.
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-5">
@@ -173,14 +173,14 @@ function App() {
                 Result
               </CardTitle>
               <CardDescription className="text-stone-400">
-                Classification and MIDI metadata will appear here.
+                Routing estimate and MIDI metadata will appear here.
               </CardDescription>
             </CardHeader>
             <CardContent>
               {result ? (
                 <div className="space-y-5">
                   <div>
-                    <p className="text-sm text-stone-400">Detected instrument</p>
+                    <p className="text-sm text-stone-400">Instrument route</p>
                     <p className="mt-1 text-4xl font-semibold">{result.instrument}</p>
                   </div>
                   <div className="grid grid-cols-2 gap-3">
