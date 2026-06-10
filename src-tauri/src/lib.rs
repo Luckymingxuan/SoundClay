@@ -60,6 +60,23 @@ fn python_executable(project_root: &PathBuf) -> PathBuf {
     }
 }
 
+fn soundclay_temp_dir() -> PathBuf {
+    std::env::temp_dir().join("soundclay")
+}
+
+fn cleanup_dir(path: PathBuf) {
+    match fs::remove_dir_all(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => eprintln!("Failed to clean {}: {error}", path.display()),
+    }
+}
+
+fn cleanup_runtime_cache() {
+    cleanup_dir(soundclay_temp_dir());
+    cleanup_dir(PathBuf::from("/private/tmp/soundclay-pycache"));
+}
+
 #[tauri::command]
 fn transcribe_audio(file_name: String, audio_bytes: Vec<u8>) -> Result<TranscriptionResult, String> {
     if audio_bytes.is_empty() {
@@ -70,7 +87,7 @@ fn transcribe_audio(file_name: String, audio_bytes: Vec<u8>) -> Result<Transcrip
         .duration_since(UNIX_EPOCH)
         .map_err(|error| error.to_string())?
         .as_millis();
-    let work_dir = std::env::temp_dir().join("soundclay").join(timestamp.to_string());
+    let work_dir = soundclay_temp_dir().join(timestamp.to_string());
     fs::create_dir_all(&work_dir).map_err(|error| error.to_string())?;
 
     let safe_file_name = sanitize_file_name(&file_name);
@@ -135,6 +152,15 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![transcribe_audio])
+        .setup(|_app| {
+            cleanup_runtime_cache();
+            Ok(())
+        })
+        .on_window_event(|_window, event| {
+            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                cleanup_runtime_cache();
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
