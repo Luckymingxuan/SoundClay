@@ -24,8 +24,9 @@ from typing import Optional
 
 SUPPORTED_EXTENSIONS = {".wav"}
 MODEL_NAME = "basic-pitch-icassp-2022"
-MAX_SAMPLES = 8
 MIN_SAMPLE_DURATION = 0.35
+SAMPLE_PREROLL_SECONDS = 0.025
+SAMPLE_RELEASE_SECONDS = 0.18
 
 @dataclass
 class AudioData:
@@ -220,44 +221,38 @@ def note_overlaps(
     return False
 
 
+def overlap_duration(
+    candidate: tuple[float, float, int, float, Optional[list[int]]],
+    note_events: list[tuple[float, float, int, float, Optional[list[int]]]],
+) -> float:
+    start, end, *_ = candidate
+    overlaps = 0.0
+    for other in note_events:
+        if other is candidate:
+            continue
+        other_start, other_end, *_ = other
+        overlaps += max(0.0, min(end, other_end) - max(start, other_start))
+    return min(end - start, overlaps)
+
+
 def sample_candidates(
     note_events: list[tuple[float, float, int, float, Optional[list[int]]]],
 ) -> list[tuple[float, float, int, float, Optional[list[int]]]]:
-    isolated = [
-        event
-        for event in note_events
-        if event[1] - event[0] >= MIN_SAMPLE_DURATION and not note_overlaps(event, note_events)
-    ]
-    pool = isolated or [
-        event for event in note_events if event[1] - event[0] >= MIN_SAMPLE_DURATION
-    ]
-
     best_by_pitch: dict[int, tuple[float, float, int, float, Optional[list[int]]]] = {}
-    for event in pool:
+    best_score_by_pitch: dict[int, float] = {}
+    for event in note_events:
         start, end, pitch, amplitude, _ = event
-        duration = min(end - start, 2.5)
-        score = duration * 0.65 + amplitude * 0.35
-        existing = best_by_pitch.get(pitch)
-        if existing is None:
-            best_by_pitch[pitch] = event
+        if end - start < MIN_SAMPLE_DURATION:
             continue
-        existing_score = min(existing[1] - existing[0], 2.5) * 0.65 + existing[3] * 0.35
-        if score > existing_score:
+
+        duration = min(end - start, 2.5)
+        isolation = 1.0 - overlap_duration(event, note_events) / max(end - start, 0.001)
+        score = duration * 0.45 + amplitude * 0.2 + isolation * 0.35
+        if score > best_score_by_pitch.get(pitch, -1.0):
             best_by_pitch[pitch] = event
+            best_score_by_pitch[pitch] = score
 
-    ranked = sorted(
-        best_by_pitch.values(),
-        key=lambda event: (min(event[1] - event[0], 2.5) * 0.65 + event[3] * 0.35),
-        reverse=True,
-    )
-    selected: list[tuple[float, float, int, float, Optional[list[int]]]] = []
-    for event in ranked:
-        if all(abs(event[2] - chosen[2]) >= 3 for chosen in selected):
-            selected.append(event)
-        if len(selected) == MAX_SAMPLES:
-            break
-
-    return sorted(selected, key=lambda event: event[2])
+    return sorted(best_by_pitch.values(), key=lambda event: event[2])
 
 
 def midi_note_name(note: int) -> str:
@@ -265,19 +260,130 @@ def midi_note_name(note: int) -> str:
     return f"{names[note % 12]}{note // 12 - 1}"
 
 
+def reject_octave_aliases(
+    candidates: list[tuple[float, float, int, float, Optional[list[int]]]],
+    audio: AudioData,
+) -> list[tuple[float, float, int, float, Optional[list[int]]]]:
+    import numpy as np
+
+    pitches = {int(event[2]) for event in candidates}
+    filtered = []
+    for event in candidates:
+        start_seconds, end_seconds, pitch, *_ = event
+        if pitch + 12 not in pitches:
+            filtered.append(event)
+            continue
+
+        start = max(0, int(start_seconds * audio.sample_rate))
+        end = min(len(audio.samples), int(end_seconds * audio.sample_rate))
+        chunk = np.asarray(audio.samples[start:end], dtype=np.float32)
+        if chunk.size < 512:
+            filtered.append(event)
+            continue
+
+        spectrum = np.abs(np.fft.rfft(chunk * np.hanning(chunk.size)))
+        frequencies = np.fft.rfftfreq(chunk.size, 1 / audio.sample_rate)
+        fundamental = 440.0 * 2 ** ((pitch - 69) / 12)
+
+        def band_peak(center: float) -> float:
+            band = (frequencies >= center * 0.985) & (frequencies <= center * 1.015)
+            return float(np.max(spectrum[band])) if np.any(band) else 0.0
+
+        if band_peak(fundamental) < band_peak(fundamental * 2) * 0.12:
+            continue
+        filtered.append(event)
+    return filtered
+
+
+def harmonic_template(frequencies, midi_pitch: int):
+    import numpy as np
+
+    fundamental = 440.0 * 2 ** ((midi_pitch - 69) / 12)
+    template = np.zeros_like(frequencies, dtype=np.float32)
+    harmonic = 1
+    while fundamental * harmonic < frequencies[-1]:
+        center = fundamental * harmonic
+        bandwidth = max(10.0, center * 0.018)
+        distance = (frequencies - center) / bandwidth
+        template += np.exp(-0.5 * distance * distance).astype(np.float32) / math.sqrt(harmonic)
+        harmonic += 1
+    return template
+
+
+def separate_note(
+    samples: list[float],
+    sample_rate: int,
+    target_event: tuple[float, float, int, float, Optional[list[int]]],
+    note_events: list[tuple[float, float, int, float, Optional[list[int]]]],
+) -> list[float]:
+    import librosa
+    import numpy as np
+
+    start_seconds, end_seconds, *_ = target_event
+    start = max(0, int((start_seconds - SAMPLE_PREROLL_SECONDS) * sample_rate))
+    end = min(len(samples), int((end_seconds + SAMPLE_RELEASE_SECONDS) * sample_rate))
+    audio = np.asarray(samples[start:end], dtype=np.float32)
+    if audio.size == 0 or not note_overlaps(target_event, note_events):
+        return audio.tolist()
+
+    n_fft = 4096 if sample_rate >= 32000 else 2048
+    hop_length = n_fft // 8
+    spectrum = librosa.stft(audio, n_fft=n_fft, hop_length=hop_length)
+    frequencies = librosa.fft_frequencies(sr=sample_rate, n_fft=n_fft)
+    frame_times = librosa.frames_to_time(
+        np.arange(spectrum.shape[1]),
+        sr=sample_rate,
+        hop_length=hop_length,
+    ) + start / sample_rate
+
+    relevant = [
+        event
+        for event in note_events
+        if event[1] + SAMPLE_RELEASE_SECONDS >= start / sample_rate
+        and event[0] - SAMPLE_PREROLL_SECONDS <= end / sample_rate
+    ]
+    templates = {
+        pitch: harmonic_template(frequencies, pitch)
+        for pitch in {int(event[2]) for event in relevant}
+    }
+    target_weight = np.zeros_like(np.abs(spectrum), dtype=np.float32)
+    total_weight = np.full_like(target_weight, 1e-4)
+
+    for relevant_event in relevant:
+        event_start, event_end, pitch, amplitude, _ = relevant_event
+        active = (
+            (frame_times >= event_start - SAMPLE_PREROLL_SECONDS)
+            & (frame_times <= event_end + SAMPLE_RELEASE_SECONDS)
+        )
+        envelope = np.zeros(frame_times.shape, dtype=np.float32)
+        envelope[active] = max(0.05, float(amplitude))
+        weight = templates[int(pitch)][:, None] * envelope[None, :]
+        total_weight += weight
+        if relevant_event is target_event:
+            target_weight += weight
+
+    mask = np.power(target_weight, 1.5) / (
+        np.power(target_weight, 1.5)
+        + np.power(np.maximum(total_weight - target_weight, 0), 1.5)
+        + 1e-6
+    )
+    separated = librosa.istft(
+        spectrum * mask,
+        hop_length=hop_length,
+        length=audio.size,
+    )
+    return separated.astype(np.float32).tolist()
+
+
 def write_sample(
     samples: list[float],
     sample_rate: int,
-    start_seconds: float,
-    end_seconds: float,
     output_path: Path,
 ) -> None:
     import numpy as np
     import soundfile as sf
 
-    start = max(0, int((start_seconds - 0.025) * sample_rate))
-    end = min(len(samples), int((end_seconds + 0.12) * sample_rate))
-    audio = np.asarray(samples[start:end], dtype=np.float32)
+    audio = np.asarray(samples, dtype=np.float32)
     if audio.size == 0:
         raise ValueError("Could not extract audio for an instrument sample.")
 
@@ -312,7 +418,7 @@ def build_instrument_package(
     note_events: list[tuple[float, float, int, float, Optional[list[int]]]],
     audio: AudioData,
 ) -> tuple[Path, Path, int]:
-    candidates = sample_candidates(note_events)
+    candidates = reject_octave_aliases(sample_candidates(note_events), audio)
     if not candidates:
         raise ValueError(
             "No notes were long enough to build an SFZ instrument. "
@@ -325,13 +431,17 @@ def build_instrument_package(
 
     sample_files = []
     for index, event in enumerate(candidates, start=1):
-        start, end, pitch, *_ = event
+        _, _, pitch, *_ = event
         sample_name = f"{index:02d}_{midi_note_name(pitch)}.wav"
-        write_sample(
+        sample_audio = separate_note(
             audio.samples,
             audio.sample_rate,
-            start,
-            end,
+            event,
+            note_events,
+        )
+        write_sample(
+            sample_audio,
+            audio.sample_rate,
             samples_dir / sample_name,
         )
         sample_files.append((pitch, sample_name))
