@@ -15,7 +15,9 @@ struct EngineResponse {
     confidence: Option<f32>,
     model: Option<String>,
     midi_path: Option<String>,
+    package_path: Option<String>,
     note_count: Option<usize>,
+    sample_count: Option<usize>,
     duration_seconds: Option<f32>,
 }
 
@@ -26,9 +28,12 @@ struct TranscriptionResult {
     confidence: f32,
     model: String,
     note_count: usize,
+    sample_count: usize,
     duration_seconds: f32,
     midi_file_name: String,
     midi_bytes: Vec<u8>,
+    instrument_file_name: String,
+    instrument_bytes: Vec<u8>,
 }
 
 fn sanitize_file_name(file_name: &str) -> String {
@@ -129,21 +134,35 @@ fn transcribe_audio(file_name: String, audio_bytes: Vec<u8>) -> Result<Transcrip
         .midi_path
         .ok_or_else(|| "Engine did not return a MIDI path.".to_string())?;
     let midi_bytes = fs::read(&midi_path).map_err(|error| error.to_string())?;
+    let package_path = response
+        .package_path
+        .ok_or_else(|| "Engine did not return an instrument package path.".to_string())?;
+    let instrument_bytes = fs::read(&package_path).map_err(|error| error.to_string())?;
     let midi_file_name = PathBuf::from(&safe_file_name)
         .with_extension("mid")
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("soundclay.mid")
         .to_string();
+    let instrument_file_name = format!(
+        "{}_soundclay.zip",
+        PathBuf::from(&safe_file_name)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("instrument")
+    );
 
     Ok(TranscriptionResult {
         instrument: response.instrument.unwrap_or_else(|| "Unknown".into()),
         confidence: response.confidence.unwrap_or(0.0),
         model: response.model.unwrap_or_else(|| "unknown".into()),
         note_count: response.note_count.unwrap_or(0),
+        sample_count: response.sample_count.unwrap_or(0),
         duration_seconds: response.duration_seconds.unwrap_or(0.0),
         midi_file_name,
         midi_bytes,
+        instrument_file_name,
+        instrument_bytes,
     })
 }
 

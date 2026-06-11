@@ -13,9 +13,9 @@ import contextlib
 import json
 import math
 import os
-import struct
 import sys
-import wave
+import tempfile
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
@@ -23,15 +23,9 @@ from typing import Optional
 
 
 SUPPORTED_EXTENSIONS = {".wav"}
-
-MODEL_BY_INSTRUMENT = {
-    "Piano": "basic-pitch-icassp-2022-piano-route",
-    "Guitar": "basic-pitch-icassp-2022-guitar-route",
-    "Bass": "basic-pitch-icassp-2022-bass-route",
-    "Vocal": "basic-pitch-icassp-2022-vocal-route",
-    "Synth": "basic-pitch-icassp-2022-synth-route",
-    "Strings": "basic-pitch-icassp-2022-strings-route",
-}
+MODEL_NAME = "basic-pitch-icassp-2022"
+MAX_SAMPLES = 8
+MIN_SAMPLE_DURATION = 0.35
 
 @dataclass
 class AudioData:
@@ -41,30 +35,14 @@ class AudioData:
 
 def read_wav(path: Path) -> AudioData:
     if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
-        raise ValueError("v1.1 currently supports WAV input. Please export your audio as .wav.")
+        raise ValueError("v1.2 currently supports WAV input. Please export your audio as .wav.")
 
-    with wave.open(str(path), "rb") as wav:
-        channels = wav.getnchannels()
-        sample_width = wav.getsampwidth()
-        sample_rate = wav.getframerate()
-        frames = wav.readframes(wav.getnframes())
+    import numpy as np
+    import soundfile as sf
 
-    if sample_width == 1:
-        values = [(byte - 128) / 128.0 for byte in frames]
-    elif sample_width == 2:
-        values = [value / 32768.0 for (value,) in struct.iter_unpack("<h", frames)]
-    elif sample_width == 4:
-        values = [value / 2147483648.0 for (value,) in struct.iter_unpack("<i", frames)]
-    else:
-        raise ValueError(f"Unsupported WAV sample width: {sample_width} bytes.")
-
-    if channels > 1:
-        mono = []
-        for index in range(0, len(values), channels):
-            mono.append(sum(values[index : index + channels]) / channels)
-        values = mono
-
-    return AudioData(sample_rate=sample_rate, samples=values)
+    values, sample_rate = sf.read(path, dtype="float32", always_2d=True)
+    mono = np.mean(values, axis=1)
+    return AudioData(sample_rate=sample_rate, samples=mono.tolist())
 
 
 def rms(samples: list[float]) -> float:
@@ -197,9 +175,13 @@ def classify_instrument(path: Path, frames: list[dict[str, float | None]]) -> tu
     )
 
 
-def transcribe_with_basic_pitch(input_path: Path, output_dir: Path) -> tuple[Path, int]:
-    os.environ.setdefault("TMPDIR", "/private/tmp")
-    os.environ.setdefault("PYTHONPYCACHEPREFIX", "/private/tmp/soundclay-pycache")
+def transcribe_with_basic_pitch(
+    input_path: Path, output_dir: Path
+) -> tuple[Path, list[tuple[float, float, int, float, Optional[list[int]]]]]:
+    for variable in ("TMPDIR", "TMP", "TEMP"):
+        os.environ[variable] = "/private/tmp"
+    os.environ["PYTHONPYCACHEPREFIX"] = "/private/tmp/soundclay-pycache"
+    tempfile.tempdir = "/private/tmp"
 
     with contextlib.redirect_stdout(sys.stderr):
         try:
@@ -221,27 +203,192 @@ def transcribe_with_basic_pitch(input_path: Path, output_dir: Path) -> tuple[Pat
 
     midi_path = output_dir / f"{input_path.stem}.mid"
     midi_data.write(str(midi_path))
-    return midi_path, len(note_events)
+    return midi_path, note_events
+
+
+def note_overlaps(
+    candidate: tuple[float, float, int, float, Optional[list[int]]],
+    note_events: list[tuple[float, float, int, float, Optional[list[int]]]],
+) -> bool:
+    start, end, *_ = candidate
+    for other in note_events:
+        if other is candidate:
+            continue
+        other_start, other_end, *_ = other
+        if min(end, other_end) - max(start, other_start) > 0.04:
+            return True
+    return False
+
+
+def sample_candidates(
+    note_events: list[tuple[float, float, int, float, Optional[list[int]]]],
+) -> list[tuple[float, float, int, float, Optional[list[int]]]]:
+    isolated = [
+        event
+        for event in note_events
+        if event[1] - event[0] >= MIN_SAMPLE_DURATION and not note_overlaps(event, note_events)
+    ]
+    pool = isolated or [
+        event for event in note_events if event[1] - event[0] >= MIN_SAMPLE_DURATION
+    ]
+
+    best_by_pitch: dict[int, tuple[float, float, int, float, Optional[list[int]]]] = {}
+    for event in pool:
+        start, end, pitch, amplitude, _ = event
+        duration = min(end - start, 2.5)
+        score = duration * 0.65 + amplitude * 0.35
+        existing = best_by_pitch.get(pitch)
+        if existing is None:
+            best_by_pitch[pitch] = event
+            continue
+        existing_score = min(existing[1] - existing[0], 2.5) * 0.65 + existing[3] * 0.35
+        if score > existing_score:
+            best_by_pitch[pitch] = event
+
+    ranked = sorted(
+        best_by_pitch.values(),
+        key=lambda event: (min(event[1] - event[0], 2.5) * 0.65 + event[3] * 0.35),
+        reverse=True,
+    )
+    selected: list[tuple[float, float, int, float, Optional[list[int]]]] = []
+    for event in ranked:
+        if all(abs(event[2] - chosen[2]) >= 3 for chosen in selected):
+            selected.append(event)
+        if len(selected) == MAX_SAMPLES:
+            break
+
+    return sorted(selected, key=lambda event: event[2])
+
+
+def midi_note_name(note: int) -> str:
+    names = ("C", "Cs", "D", "Ds", "E", "F", "Fs", "G", "Gs", "A", "As", "B")
+    return f"{names[note % 12]}{note // 12 - 1}"
+
+
+def write_sample(
+    samples: list[float],
+    sample_rate: int,
+    start_seconds: float,
+    end_seconds: float,
+    output_path: Path,
+) -> None:
+    import numpy as np
+    import soundfile as sf
+
+    start = max(0, int((start_seconds - 0.025) * sample_rate))
+    end = min(len(samples), int((end_seconds + 0.12) * sample_rate))
+    audio = np.asarray(samples[start:end], dtype=np.float32)
+    if audio.size == 0:
+        raise ValueError("Could not extract audio for an instrument sample.")
+
+    audio -= np.mean(audio)
+    peak = float(np.max(np.abs(audio)))
+    if peak > 0:
+        audio *= min(4.0, 0.95 / peak)
+
+    fade_in = min(audio.size // 4, max(1, int(sample_rate * 0.005)))
+    fade_out = min(audio.size // 3, max(1, int(sample_rate * 0.04)))
+    audio[:fade_in] *= np.linspace(0.0, 1.0, fade_in, dtype=np.float32)
+    audio[-fade_out:] *= np.linspace(1.0, 0.0, fade_out, dtype=np.float32)
+    sf.write(output_path, audio, sample_rate, subtype="PCM_16")
+
+
+def sfz_key_ranges(pitches: list[int]) -> list[tuple[int, int]]:
+    if len(pitches) == 1:
+        return [(0, 127)]
+
+    ranges = []
+    for index, pitch in enumerate(pitches):
+        low = 0 if index == 0 else (pitches[index - 1] + pitch) // 2 + 1
+        high = 127 if index == len(pitches) - 1 else (pitch + pitches[index + 1]) // 2
+        ranges.append((low, high))
+    return ranges
+
+
+def build_instrument_package(
+    input_path: Path,
+    output_dir: Path,
+    midi_path: Path,
+    note_events: list[tuple[float, float, int, float, Optional[list[int]]]],
+    audio: AudioData,
+) -> tuple[Path, Path, int]:
+    candidates = sample_candidates(note_events)
+    if not candidates:
+        raise ValueError(
+            "No notes were long enough to build an SFZ instrument. "
+            "Try audio with notes held for at least 0.35 seconds."
+        )
+
+    instrument_dir = output_dir / f"{input_path.stem}_instrument"
+    samples_dir = instrument_dir / "samples"
+    samples_dir.mkdir(parents=True, exist_ok=True)
+
+    sample_files = []
+    for index, event in enumerate(candidates, start=1):
+        start, end, pitch, *_ = event
+        sample_name = f"{index:02d}_{midi_note_name(pitch)}.wav"
+        write_sample(
+            audio.samples,
+            audio.sample_rate,
+            start,
+            end,
+            samples_dir / sample_name,
+        )
+        sample_files.append((pitch, sample_name))
+
+    sfz_path = instrument_dir / f"{input_path.stem}.sfz"
+    pitches = [pitch for pitch, _ in sample_files]
+    lines = [
+        "// Generated by SoundClay v1.2",
+        "<global> ampeg_attack=0.005 ampeg_release=0.25",
+        "",
+    ]
+    for (pitch, sample_name), (low, high) in zip(sample_files, sfz_key_ranges(pitches)):
+        lines.append(
+            f"<region> sample=samples/{sample_name} "
+            f"pitch_keycenter={pitch} lokey={low} hikey={high}"
+        )
+    sfz_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    package_path = output_dir / f"{input_path.stem}_soundclay.zip"
+    with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.write(midi_path, f"{input_path.stem}.mid")
+        archive.write(sfz_path, sfz_path.name)
+        for _, sample_name in sample_files:
+            archive.write(samples_dir / sample_name, f"samples/{sample_name}")
+
+    return sfz_path, package_path, len(sample_files)
 
 
 def process(input_path: Path, output_dir: Path) -> dict[str, object]:
     audio = read_wav(input_path)
     frames = analyze_frames(audio)
     instrument, confidence, features = classify_instrument(input_path, frames)
-    model = MODEL_BY_INSTRUMENT[instrument]
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    midi_path, note_count = transcribe_with_basic_pitch(input_path, output_dir)
+    midi_path, note_events = transcribe_with_basic_pitch(input_path, output_dir)
+    note_count = len(note_events)
 
     if note_count == 0:
         raise ValueError("Basic Pitch did not detect notes. Try a cleaner single-instrument WAV file.")
 
+    sfz_path, package_path, sample_count = build_instrument_package(
+        input_path,
+        output_dir,
+        midi_path,
+        note_events,
+        audio,
+    )
+
     return {
         "instrument": instrument,
         "confidence": round(confidence, 2),
-        "model": model,
+        "model": MODEL_NAME,
         "midiPath": str(midi_path),
+        "sfzPath": str(sfz_path),
+        "packagePath": str(package_path),
         "noteCount": note_count,
+        "sampleCount": sample_count,
         "durationSeconds": round(len(audio.samples) / audio.sample_rate, 2),
         "features": features,
     }

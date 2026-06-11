@@ -24,9 +24,12 @@ type TranscriptionResult = {
   confidence: number;
   model: string;
   noteCount: number;
+  sampleCount: number;
   durationSeconds: number;
   midiFileName: string;
   midiBytes: number[];
+  instrumentFileName: string;
+  instrumentBytes: number[];
 };
 
 function App() {
@@ -84,18 +87,34 @@ function App() {
     URL.revokeObjectURL(url);
   }
 
+  function downloadInstrument() {
+    if (!result) {
+      return;
+    }
+
+    const blob = new Blob([new Uint8Array(result.instrumentBytes)], {
+      type: "application/zip",
+    });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = result.instrumentFileName;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
   return (
     <main className="min-h-screen overflow-hidden bg-[radial-gradient(circle_at_20%_20%,rgba(20,184,166,0.18),transparent_30%),radial-gradient(circle_at_80%_10%,rgba(251,191,36,0.18),transparent_28%),linear-gradient(135deg,#fafaf9_0%,#f5f0e8_100%)] px-5 py-8 text-stone-950">
       <section className="mx-auto flex min-h-[calc(100vh-4rem)] w-full max-w-5xl flex-col justify-center gap-8">
         <div className="max-w-3xl space-y-5">
-          <Badge className="bg-white/70 backdrop-blur">SoundClay v1.1</Badge>
+          <Badge className="bg-white/70 backdrop-blur">SoundClay v1.2</Badge>
           <div className="space-y-4">
             <h1 className="text-5xl font-semibold tracking-tight text-balance md:text-7xl">
               Audio in. MIDI out.
             </h1>
             <p className="max-w-2xl text-lg leading-8 text-stone-600">
-              Upload a single-instrument WAV. SoundClay routes the source,
-              runs the open-source Basic Pitch model, and exports editable MIDI.
+              Upload a single-instrument WAV. SoundClay transcribes the notes,
+              extracts playable samples, and exports editable MIDI plus SFZ.
             </p>
           </div>
         </div>
@@ -105,10 +124,10 @@ function App() {
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
                 <UploadCloud className="size-5" />
-                Create MIDI
+                Create assets
               </CardTitle>
               <CardDescription>
-                v1.1 uses Basic Pitch for MIDI transcription and WAV input.
+                v1.2 creates MIDI and an experimental SFZ instrument from WAV input.
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-5">
@@ -133,7 +152,7 @@ function App() {
                 type="file"
               />
 
-              <div className="flex flex-col gap-3 sm:flex-row">
+              <div className="grid gap-3 sm:grid-cols-3">
                 <Button
                   className="flex-1"
                   disabled={!selectedFile || isProcessing}
@@ -145,7 +164,7 @@ function App() {
                   ) : (
                     <Sparkles className="size-4" />
                   )}
-                  {isProcessing ? "Listening..." : "Generate MIDI"}
+                  {isProcessing ? "Listening..." : "Generate"}
                 </Button>
                 <Button
                   disabled={!result}
@@ -155,6 +174,15 @@ function App() {
                 >
                   <ArrowDownToLine className="size-4" />
                   Download
+                </Button>
+                <Button
+                  disabled={!result}
+                  onClick={downloadInstrument}
+                  size="lg"
+                  variant="secondary"
+                >
+                  <ArrowDownToLine className="size-4" />
+                  Instrument
                 </Button>
               </div>
 
@@ -173,7 +201,7 @@ function App() {
                 Result
               </CardTitle>
               <CardDescription className="text-stone-400">
-                Routing estimate and MIDI metadata will appear here.
+                MIDI and SFZ instrument metadata will appear here.
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -186,8 +214,10 @@ function App() {
                   <div className="grid grid-cols-2 gap-3">
                     <Metric label="Confidence" value={`${Math.round(result.confidence * 100)}%`} />
                     <Metric label="Notes" value={result.noteCount.toString()} />
+                    <Metric label="Samples" value={result.sampleCount.toString()} />
                     <Metric label="Duration" value={`${result.durationSeconds}s`} />
-                    <Metric label="Output" value={result.midiFileName} />
+                    <Metric label="MIDI" value={result.midiFileName} />
+                    <Metric label="Instrument" value={result.instrumentFileName} />
                   </div>
                   <div className="rounded-xl border border-white/10 bg-white/5 p-4">
                     <p className="text-xs uppercase tracking-[0.2em] text-stone-500">
