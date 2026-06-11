@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
+use tauri::Manager;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -82,8 +83,55 @@ fn cleanup_runtime_cache() {
     cleanup_dir(PathBuf::from("/private/tmp/soundclay-pycache"));
 }
 
+fn available_download_path(download_dir: &Path, file_name: &str) -> PathBuf {
+    let requested = PathBuf::from(file_name);
+    let stem = requested
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("soundclay");
+    let extension = requested.extension().and_then(|value| value.to_str());
+    let mut candidate = download_dir.join(file_name);
+    let mut suffix = 1;
+
+    while candidate.exists() {
+        let numbered_name = match extension {
+            Some(extension) => format!("{stem} ({suffix}).{extension}"),
+            None => format!("{stem} ({suffix})"),
+        };
+        candidate = download_dir.join(numbered_name);
+        suffix += 1;
+    }
+
+    candidate
+}
+
 #[tauri::command]
-fn transcribe_audio(file_name: String, audio_bytes: Vec<u8>) -> Result<TranscriptionResult, String> {
+fn save_download(
+    app: tauri::AppHandle,
+    file_name: String,
+    file_bytes: Vec<u8>,
+) -> Result<String, String> {
+    if file_bytes.is_empty() {
+        return Err("The generated file is empty.".into());
+    }
+
+    let safe_file_name = sanitize_file_name(&file_name);
+    let download_dir = app
+        .path()
+        .download_dir()
+        .map_err(|error| error.to_string())?;
+    fs::create_dir_all(&download_dir).map_err(|error| error.to_string())?;
+    let output_path = available_download_path(&download_dir, &safe_file_name);
+    fs::write(&output_path, file_bytes).map_err(|error| error.to_string())?;
+
+    Ok(output_path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn transcribe_audio(
+    file_name: String,
+    audio_bytes: Vec<u8>,
+) -> Result<TranscriptionResult, String> {
     if audio_bytes.is_empty() {
         return Err("The selected audio file is empty.".into());
     }
@@ -121,7 +169,10 @@ fn transcribe_audio(file_name: String, audio_bytes: Vec<u8>) -> Result<Transcrip
         .find(|line| line.trim_start().starts_with('{'))
         .ok_or_else(|| format!("Engine did not return JSON. stderr: {}", stderr.trim()))?;
     let response: EngineResponse = serde_json::from_str(json_line.trim()).map_err(|error| {
-        format!("Engine returned invalid JSON: {error}. stderr: {}", stderr.trim())
+        format!(
+            "Engine returned invalid JSON: {error}. stderr: {}",
+            stderr.trim()
+        )
     })?;
 
     if !output.status.success() || !response.ok {
@@ -170,7 +221,7 @@ fn transcribe_audio(file_name: String, audio_bytes: Vec<u8>) -> Result<Transcrip
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![transcribe_audio])
+        .invoke_handler(tauri::generate_handler![save_download, transcribe_audio])
         .setup(|_app| {
             cleanup_runtime_cache();
             Ok(())
@@ -182,4 +233,29 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::available_download_path;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    #[test]
+    fn adds_suffix_when_download_exists() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("soundclay-download-test-{unique}"));
+        fs::create_dir_all(&directory).expect("test directory should be created");
+        fs::write(directory.join("song.mid"), b"existing").expect("fixture should be written");
+
+        let output = available_download_path(&directory, "song.mid");
+
+        assert_eq!(output, directory.join("song (1).mid"));
+        fs::remove_dir_all(directory).expect("test directory should be removed");
+    }
 }

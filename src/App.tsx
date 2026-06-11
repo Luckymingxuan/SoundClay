@@ -3,10 +3,12 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   ArrowDownToLine,
   AudioWaveform,
+  CheckCircle2,
   FileMusic,
   Loader2,
   Sparkles,
   UploadCloud,
+  X,
 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
@@ -32,18 +34,26 @@ type TranscriptionResult = {
   instrumentBytes: number[];
 };
 
+type Notice = {
+  title: string;
+  message: string;
+  path?: string;
+};
+
 function App() {
   const inputRef = useRef<HTMLInputElement>(null);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [result, setResult] = useState<TranscriptionResult | null>(null);
   const [error, setError] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
+  const [notice, setNotice] = useState<Notice | null>(null);
 
   function onFileChange(event: ChangeEvent<HTMLInputElement>) {
     const file = event.currentTarget.files?.[0] ?? null;
     setSelectedFile(file);
     setResult(null);
     setError("");
+    setNotice(null);
   }
 
   async function transcribe() {
@@ -64,6 +74,10 @@ function App() {
         audioBytes,
       });
       setResult(response);
+      setNotice({
+        title: "Generation complete",
+        message: `Created ${response.noteCount} MIDI notes and ${response.sampleCount} instrument samples. The files have not been saved yet.`,
+      });
     } catch (caughtError) {
       setError(caughtError instanceof Error ? caughtError.message : String(caughtError));
     } finally {
@@ -71,36 +85,41 @@ function App() {
     }
   }
 
-  function downloadMidi() {
-    if (!result) {
-      return;
+  async function saveGeneratedFile(fileName: string, fileBytes: number[], label: string) {
+    setError("");
+    try {
+      const savedPath = await invoke<string>("save_download", {
+        fileName,
+        fileBytes,
+      });
+      setNotice({
+        title: `${label} saved`,
+        message: "The download completed successfully.",
+        path: savedPath,
+      });
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : String(caughtError));
     }
-
-    const blob = new Blob([new Uint8Array(result.midiBytes)], {
-      type: "audio/midi",
-    });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = result.midiFileName;
-    anchor.click();
-    URL.revokeObjectURL(url);
   }
 
-  function downloadInstrument() {
+  async function downloadMidi() {
     if (!result) {
       return;
     }
 
-    const blob = new Blob([new Uint8Array(result.instrumentBytes)], {
-      type: "application/zip",
-    });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = result.instrumentFileName;
-    anchor.click();
-    URL.revokeObjectURL(url);
+    await saveGeneratedFile(result.midiFileName, result.midiBytes, "MIDI");
+  }
+
+  async function downloadInstrument() {
+    if (!result) {
+      return;
+    }
+
+    await saveGeneratedFile(
+      result.instrumentFileName,
+      result.instrumentBytes,
+      "Instrument",
+    );
   }
 
   return (
@@ -238,7 +257,56 @@ function App() {
           </Card>
         </div>
       </section>
+      {notice ? <SuccessNotice notice={notice} onClose={() => setNotice(null)} /> : null}
     </main>
+  );
+}
+
+function SuccessNotice({ notice, onClose }: { notice: Notice; onClose: () => void }) {
+  return (
+    <div
+      aria-modal="true"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-stone-950/40 p-5 backdrop-blur-sm"
+      role="dialog"
+    >
+      <Card className="w-full max-w-md border-white/70 bg-white shadow-2xl">
+        <CardHeader>
+          <div className="flex items-start justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <span className="flex size-10 items-center justify-center rounded-full bg-emerald-100 text-emerald-700">
+                <CheckCircle2 className="size-5" />
+              </span>
+              <div>
+                <CardTitle>{notice.title}</CardTitle>
+                <CardDescription className="mt-1">{notice.message}</CardDescription>
+              </div>
+            </div>
+            <Button
+              aria-label="Close"
+              className="size-8 p-0"
+              onClick={onClose}
+              size="sm"
+              variant="ghost"
+            >
+              <X className="size-4" />
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {notice.path ? (
+            <div className="rounded-xl border bg-stone-50 p-3">
+              <p className="text-xs font-medium uppercase tracking-wider text-stone-500">
+                Saved to
+              </p>
+              <p className="mt-2 break-all font-mono text-sm text-stone-800">{notice.path}</p>
+            </div>
+          ) : null}
+          <Button className="w-full" onClick={onClose}>
+            Done
+          </Button>
+        </CardContent>
+      </Card>
+    </div>
   );
 }
 
